@@ -1,0 +1,12 @@
+node_modules/
+db-services/
+dist/
+.next/
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.log
+*.zip
+*.tar.gz

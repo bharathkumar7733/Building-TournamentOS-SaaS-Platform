@@ -1,0 +1,20 @@
+{
+  "name": "tournamentos",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "apps/api",
+    "apps/web"
+  ],
+  "scripts": {
+    "dev:api": "npm run start:dev --workspace=apps/api",
+    "dev:web": "npm run dev --workspace=apps/web",
+    "build:api": "npm run build --workspace=apps/api",
+    "build:web": "npm run build --workspace=apps/web",
+    "build": "npm run build --workspaces",
+    "test:api": "npm run test --workspace=apps/api"
+  },
+  "dependencies": {
+    "caniuse-lite": "^1.0.30001799"
+  }
+}

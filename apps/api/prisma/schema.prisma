@@ -1,0 +1,556 @@
+datasource db {
+  provider = "postgresql"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum UserRole {
+  PLAYER
+  SCORE_ADMIN
+  TOURNAMENT_ADMIN
+  SUPER_ADMIN
+}
+
+enum TournamentStatus {
+  DRAFT
+  REGISTRATION_OPEN
+  REGISTRATION_CLOSED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+/// Phase 2: Expanded lifecycle — includes WAITLISTED and WITHDRAWN.
+enum TeamStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  WAITLISTED
+  BLACKLISTED
+  WITHDRAWN
+}
+
+enum MatchState {
+  UPCOMING
+  LIVE
+  PAUSED
+  COMPLETED
+  ABANDONED
+}
+
+enum DecisionSource {
+  AUTO
+  ADMIN_OVERRIDE
+}
+
+enum QualificationStatus {
+  QUALIFIED
+  ELIMINATED
+}
+
+/// Phase 2: Template visibility scoping.
+enum TemplateVisibility {
+  SYSTEM       // Available to all organizations (global)
+  ORGANIZATION // Available only within a single organization
+  PRIVATE      // Available only to the creator
+}
+
+enum IdempotencyState {
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum RoomAssignmentAction {
+  ASSIGNED
+  MOVED
+  REMOVED
+  LOCKED
+}
+
+enum FreezeScope {
+  REGISTRATION
+  ROOMS
+  SCORING
+  MATCH_CONTROL
+  ALL
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MULTI-TENANCY
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Organization {
+  id          String       @id @default(cuid())
+  name        String
+  slug        String       @unique
+  plan        String       @default("FREE")
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+
+  users       User[]
+  tournaments Tournament[]
+  templates   TournamentTemplate[]
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// USERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+model User {
+  id             String        @id @default(cuid())
+  email          String        @unique
+  name           String?
+  role           UserRole      @default(PLAYER)
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@index([organizationId])
+  @@index([role])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TOURNAMENT TEMPLATES
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A reusable tournament blueprint (e.g. "Free Fire Standard 240-Team")
+/// that auto-generates stages when applied to a new tournament.
+model TournamentTemplate {
+  id             String              @id @default(cuid())
+  organizationId String?             // null = global/system template
+  organization   Organization?       @relation(fields: [organizationId], references: [id])
+  name           String              // e.g. "Free Fire Standard"
+  game           String
+  /// Phase 2: Visibility scoping — SYSTEM templates are available globally.
+  visibility     TemplateVisibility  @default(SYSTEM)
+  /// JSON array of stage blueprints:
+  /// [{ name, order, qualificationRule, roundCount, roomCapacity }]
+  stageBlueprint Json
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+
+  tournaments    Tournament[]
+
+  @@index([organizationId])
+  @@index([visibility])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TOURNAMENT
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Core tournament entity. All mutable configuration lives in `config` JSONB
+/// so scoring rules, point tables, and capacity can evolve without migrations.
+model Tournament {
+  id             String           @id @default(cuid())
+  organizationId String
+  organization   Organization     @relation(fields: [organizationId], references: [id])
+  templateId     String?
+  template       TournamentTemplate? @relation(fields: [templateId], references: [id])
+
+  name           String
+  game           String
+  status         TournamentStatus @default(DRAFT)
+  startDate      DateTime
+  rules          String?          @db.Text
+
+  /// Flexible JSONB config — replaces flat columns.
+  /// Shape (TypeScript interface in shared/types):
+  /// {
+  ///   maxTeams: number,
+  ///   roomCapacity: number,
+  ///   qualificationType: "TOP_X_PER_ROOM" | "OVERALL_RANKING" | "MANUAL",
+  ///   pointTable: Record<string, number>,
+  ///   killPoints: number,
+  ///   tiebreaker: "kills" | "placement",
+  /// }
+  config         Json
+
+  /// Phase 2: Registration window — derived from these timestamps, not booleans.
+  registrationStartsAt  DateTime?
+  registrationEndsAt    DateTime?
+
+  createdBy      String
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  deletedAt      DateTime?
+  deletedBy      String?          // Phase 2: audit who soft-deleted
+  operationsFrozen Boolean @default(false)
+  freezeVersion    Int @default(1)
+  frozenBy         String?
+  frozenAt         DateTime?
+  freezeReason     String?
+  freezeScopes     FreezeScope[]
+  freezeExpiresAt  DateTime?
+  freezeEndedAt    DateTime?
+  freezeEndReason  String?
+
+  stages         Stage[]
+  teams          Team[]
+  players        Player[]
+  domainEvents   DomainEvent[]
+
+  @@index([organizationId])
+  @@index([status])
+  @@index([startDate])
+  @@index([deletedAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STAGES / ROUNDS / ROOMS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A named phase of the tournament (e.g. Qualifier, Semi-Final, Final).
+model Stage {
+  id                     String                  @id @default(cuid())
+  tournamentId           String
+  tournament             Tournament              @relation(fields: [tournamentId], references: [id])
+  name                   String
+  /// JSON qualification rule, e.g. { type:"TOP_X", x:3 }
+  qualificationRule      Json?
+  order                  Int
+  createdAt              DateTime                @default(now())
+  updatedAt              DateTime                @updatedAt
+  deletedAt              DateTime?
+  deletedBy              String?                 // Phase 2: audit
+
+  rounds                 Round[]
+  qualificationDecisions QualificationDecision[]
+  standingSnapshots      StageStandingSnapshot[]
+
+  @@index([tournamentId])
+  @@index([deletedAt])
+}
+
+model Round {
+  id          String   @id @default(cuid())
+  stageId     String
+  stage       Stage    @relation(fields: [stageId], references: [id])
+  roundNumber Int
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  rooms       Room[]
+
+  @@index([stageId])
+}
+
+model Room {
+  id          String           @id @default(cuid())
+  roundId     String
+  round       Round            @relation(fields: [roundId], references: [id])
+  roomNumber  Int
+  capacity    Int
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  deletedAt   DateTime?
+  deletedBy   String?          // Phase 2: audit
+  isLocked    Boolean          @default(false)
+
+  assignments       RoomAssignment[]
+  matches           Match[]
+  standingSnapshots RoomStandingSnapshot[]
+
+  @@index([roundId])
+  @@index([deletedAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TEAMS  (Phase 2: WAITLISTED, WITHDRAWN, waitlistPosition, registrationSnapshot)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Team {
+  id             String     @id @default(cuid())
+  tournamentId   String
+  tournament     Tournament @relation(fields: [tournamentId], references: [id])
+  name           String
+  status         TeamStatus @default(PENDING)
+  captainName    String?
+  captainUid     String?    // Phase 2: locked after submission — cannot be changed
+  whatsapp       String?
+
+  /// Phase 2: Atomically persisted waitlist position.
+  /// Assigned at registration time if tournament is at capacity.
+  /// DO NOT compute dynamically — positions persist across approvals.
+  waitlistPosition  Int?
+
+  /// Phase 2: Snapshot of team details at submission time.
+  /// Preserved even if team edits their details later.
+  registrationSnapshot Json?
+
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+  deletedAt      DateTime?
+  deletedBy      String?    // Phase 2: audit
+  statusChangedBy  String?
+  statusChangedAt  DateTime?
+  statusReason     String?
+  previousStatus   TeamStatus?
+  statusSource     String?    // "ADMIN", "AUTO", "SYSTEM"
+
+  players                Player[]
+  roomAssignments        RoomAssignment[]
+  matchResults           MatchResult[]
+  qualificationDecisions QualificationDecision[]
+
+  @@index([tournamentId])
+  @@index([status])
+  @@index([deletedAt])
+  @@index([waitlistPosition])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PLAYERS  (Phase 2: tournament-level UID uniqueness)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Player {
+  id           String     @id @default(cuid())
+  teamId       String
+  team         Team       @relation(fields: [teamId], references: [id])
+  /// Phase 2: Foreign key to Tournament for tournament-level UID constraint.
+  tournamentId String
+  tournament   Tournament @relation(fields: [tournamentId], references: [id])
+  gameUid      String
+  name         String
+  isCaptain    Boolean    @default(false)
+  isSubstitute Boolean    @default(false)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  /// Phase 2: DB-level unique constraint — one gameUid per tournament.
+  /// This prevents concurrent duplicate registrations at the database level.
+  @@unique([tournamentId, gameUid])
+  @@index([teamId])
+  @@index([tournamentId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ROOM ASSIGNMENTS (append-only)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model RoomAssignment {
+  id             String               @id @default(cuid())
+  teamId         String
+  team           Team                 @relation(fields: [teamId], references: [id])
+  roomId         String
+  room           Room                 @relation(fields: [roomId], references: [id])
+  action         RoomAssignmentAction
+  previousRoomId String?
+  reason         String?
+  actorId        String
+  version        Int                  @default(1)
+  createdAt      DateTime             @default(now())
+
+  @@index([teamId])
+  @@index([roomId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MATCHES & RESULTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Match {
+  id               String        @id @default(cuid())
+  roomId           String
+  room             Room          @relation(fields: [roomId], references: [id])
+  state            MatchState    @default(UPCOMING)
+  scheduledAt      DateTime
+  startedAt        DateTime?
+  endedAt          DateTime?
+  pausedAt         DateTime?
+  pausedDurationMs Int           @default(0)
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  results          MatchResult[]
+  events           MatchEvent[]
+
+  @@index([roomId])
+  @@index([state])
+}
+
+model MatchResult {
+  id              String   @id @default(cuid())
+  matchId         String
+  match           Match    @relation(fields: [matchId], references: [id])
+  teamId          String
+  team            Team     @relation(fields: [teamId], references: [id])
+  placement       Int
+  kills           Int
+  placementPoints Int
+  killsPoints     Int
+  scoreVersion    Int      @default(1)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([matchId, teamId])
+  @@index([matchId])
+  @@index([teamId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// QUALIFICATION
+// ─────────────────────────────────────────────────────────────────────────────
+
+model QualificationDecision {
+  id         String              @id @default(cuid())
+  teamId     String
+  team       Team                @relation(fields: [teamId], references: [id])
+  stageId    String
+  stage      Stage               @relation(fields: [stageId], references: [id])
+  decision   QualificationStatus
+  source     DecisionSource
+  reason     String?
+  beforeRank Int?
+  afterRank  Int?
+  approvedBy String
+  createdAt  DateTime            @default(now())
+
+  @@index([teamId])
+  @@index([stageId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DOMAIN EVENTS  (Outbox pattern)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Outbox-pattern domain events. Persisted synchronously with the mutation,
+/// then dispatched asynchronously by a background worker.
+model DomainEvent {
+  id           String    @id @default(cuid())
+  tournamentId String?
+  tournament   Tournament? @relation(fields: [tournamentId], references: [id])
+  type         String    // e.g. "TeamRegistered", "TeamApproved"
+  payload      Json
+  dispatchedAt DateTime?  // null = pending dispatch
+  createdAt    DateTime   @default(now())
+
+  @@index([tournamentId])
+  @@index([dispatchedAt])
+  @@index([type])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AUDIT LOGS
+// ─────────────────────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  actorId   String
+  action    String
+  entity    String
+  entityId  String?
+  before    Json?
+  after     Json?
+  reason    String?
+  ipAddress String?
+  createdAt DateTime @default(now())
+
+  @@index([entity, entityId])
+  @@index([actorId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RELEASE GATE & STAGE REPRODUCIBILITY
+// ─────────────────────────────────────────────────────────────────────────────
+
+model IdempotencyKey {
+  id             String           @id @default(cuid())
+  organizationId String
+  userId         String?
+  key            String
+  requestHash    String
+  resourceType   String?
+  resourceId     String?
+  responseStatus Int?
+  responseBody   Json?
+  state          IdempotencyState @default(PROCESSING)
+  createdAt      DateTime         @default(now())
+  expiresAt      DateTime
+
+  @@unique([organizationId, key])
+  @@index([expiresAt])
+}
+
+model QualificationRun {
+  id        String   @id @default(cuid())
+  stageId   String
+  strategy  String   // e.g. "TOP_X_PER_ROOM"
+  results   Json     // Standing snapshot
+  createdAt DateTime @default(now())
+}
+
+model StandingsRecomputeJob {
+  id            String    @id @default(cuid())
+  scope         String    // "ROOM" | "STAGE"
+  scopeId       String
+  status        String    // "PENDING" | "PROCESSING" | "COMPLETED" | "FAILED"
+  workerId      String?
+  leasedUntil   DateTime?
+  retryCount    Int       @default(0)
+  lastFailure   String?
+  nextAttemptAt DateTime?
+  createdAt     DateTime  @default(now())
+  startedAt     DateTime?
+  completedAt   DateTime?
+
+  @@index([status, createdAt])
+}
+
+model MatchEvent {
+  id        String   @id @default(cuid())
+  matchId   String
+  match     Match    @relation(fields: [matchId], references: [id])
+  type      String   // e.g. "START", "PAUSE", "RESUME", "SCORE_UPDATE", "REVERT", "COMPLETE", "ABANDON"
+  payload   Json
+  createdAt DateTime @default(now())
+  actorId   String
+
+  @@index([matchId])
+}
+
+model RoomStandingSnapshot {
+  id        String   @id @default(cuid())
+  roomId    String
+  room      Room     @relation(fields: [roomId], references: [id])
+  standings Json     // [{ teamId, kills, placement, points }]
+  version   Int      @default(1)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  @@unique([roomId, version])
+  @@index([roomId])
+  @@index([roomId, active])
+}
+
+model StageStandingSnapshot {
+  id        String   @id @default(cuid())
+  stageId   String
+  stage     Stage    @relation(fields: [stageId], references: [id])
+  standings Json     // [{ teamId, kills, placement, points }]
+  version   Int      @default(1)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  @@unique([stageId, version])
+  @@index([stageId])
+  @@index([stageId, active])
+}
+
+model StandingsDeadLetter {
+  id       String   @id @default(cuid())
+  jobId    String
+  payload  Json
+  reason   String
+  failedAt DateTime @default(now())
+}
+
